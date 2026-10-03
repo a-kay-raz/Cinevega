@@ -1,0 +1,178 @@
+name: CineMovie + Vega APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cinemovie-vega-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  VEGA_REPO: https://github.com/vega-org/vega-app.git
+  VEGA_REF: v4.0.6
+  NODE_VERSION: "20"
+  JAVA_VERSION: "17"
+
+jobs:
+  build:
+    name: Build CineMovie + Vega
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout CineMovie integration source
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: gradle
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            vendor/vega-app/package-lock.json
+
+      - name: Download Vega v4.0.6
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf vendor/vega-app
+          mkdir -p vendor
+          git clone --depth 1 --branch "$VEGA_REF" "$VEGA_REPO" vendor/vega-app
+          git -C vendor/vega-app rev-parse HEAD
+          git -C vendor/vega-app describe --tags --always || true
+
+      - name: Install Vega dependencies
+        working-directory: vendor/vega-app
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm ci
+
+      - name: Apply CineMovie integration
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -f scripts/apply-overlay.mjs ]; then
+            node scripts/apply-overlay.mjs vendor/vega-app
+          else
+            echo "No overlay script found; building unmodified Vega source."
+          fi
+
+      - name: Validate integration
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -f scripts/validate-overlay.mjs ]; then
+            node scripts/validate-overlay.mjs vendor/vega-app
+          fi
+
+          if [ -f scripts/test-quality-selection.mjs ]; then
+            node scripts/test-quality-selection.mjs
+          fi
+
+      - name: Generate Android project
+        working-directory: vendor/vega-app
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm run build:sandbox
+          npx expo prebuild -p android --clean
+
+      - name: Build release APK
+        working-directory: vendor/vega-app/android
+        shell: bash
+        run: |
+          set -o pipefail
+          chmod +x gradlew
+
+          ./gradlew assembleRelease \
+            --no-daemon \
+            --stacktrace \
+            --info \
+            2>&1 | tee "$GITHUB_WORKSPACE/gradle-build.log"
+
+      - name: Collect build diagnostics
+        if: always()
+        shell: bash
+        run: |
+          set +e
+
+          mkdir -p build-logs
+
+          {
+            echo "===== GitHub Actions ====="
+            echo "Run: $GITHUB_RUN_ID"
+            echo "Commit: $GITHUB_SHA"
+            echo "Branch: $GITHUB_REF_NAME"
+            echo "Workflow: $GITHUB_WORKFLOW"
+            echo
+            echo "===== Tool versions ====="
+            node --version
+            npm --version
+            java -version
+            echo
+            echo "===== Vega commit ====="
+            if [ -d vendor/vega-app/.git ]; then
+              git -C vendor/vega-app rev-parse HEAD
+              git -C vendor/vega-app describe --tags --always
+            fi
+          } > build-logs/build-summary.txt 2>&1
+
+          if [ -f gradle-build.log ]; then
+            cp gradle-build.log build-logs/gradle-build.log
+          fi
+
+          if [ -d vendor/vega-app/android ]; then
+            find vendor/vega-app/android \
+              -type f \
+              \( -name "*.log" -o -name "hs_err_pid*.log" \) \
+              -print \
+              -exec sh -c 'echo "===== $1 ====="; cat "$1"' _ {} \; \
+              > build-logs/native-logs.txt 2>&1 || true
+          fi
+
+          if [ -d vendor/vega-app/android/app/build/reports ]; then
+            cp -R vendor/vega-app/android/app/build/reports build-logs/android-reports
+          fi
+
+          if [ -d vendor/vega-app/android/app/build/outputs ]; then
+            find vendor/vega-app/android/app/build/outputs \
+              -type f -print \
+              > build-logs/generated-files.txt 2>&1 || true
+          fi
+
+      - name: Upload APK
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: CineMovie-Vega-v4.0.6-APK
+          path: |
+            vendor/vega-app/android/app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: CineMovie-Vega-Build-Logs
+          path: build-logs/
+          if-no-files-found: warn
+          retention-days: 30
