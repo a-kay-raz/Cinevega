@@ -1,4 +1,4 @@
-name: CineMovie + Vega APK
+name: CineMovie + Vega APK v2
 
 on:
   workflow_dispatch:
@@ -24,11 +24,34 @@ jobs:
   build:
     name: Build CineMovie + Vega
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
 
     steps:
-      - name: Checkout CineMovie integration source
+      - name: Prepare diagnostics
+        shell: bash
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/build-logs"
+          echo "Workflow started: $(date -u)" \
+            > "$GITHUB_WORKSPACE/build-logs/workflow-start.txt"
+
+      - name: Checkout source
         uses: actions/checkout@v4
+
+      - name: Record source tree
+        shell: bash
+        run: |
+          set +e
+          {
+            echo "===== ROOT ====="
+            pwd
+            ls -la
+
+            echo
+            echo "===== FILES ====="
+            find . -maxdepth 3 -type f \
+              ! -path './.git/*' \
+              | sort | head -500
+          } > build-logs/source-tree.txt 2>&1
 
       - name: Setup Java
         uses: actions/setup-java@v4
@@ -41,122 +64,316 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: ${{ env.NODE_VERSION }}
-          cache: npm
-          cache-dependency-path: |
-            package-lock.json
-            vendor/vega-app/package-lock.json
 
-      - name: Download Vega v4.0.6
+      - name: Record environment
         shell: bash
         run: |
-          set -euo pipefail
-          rm -rf vendor/vega-app
-          mkdir -p vendor
-          git clone --depth 1 --branch "$VEGA_REF" "$VEGA_REPO" vendor/vega-app
-          git -C vendor/vega-app rev-parse HEAD
-          git -C vendor/vega-app describe --tags --always || true
+          set +e
+          {
+            echo "===== SYSTEM ====="
+            uname -a
+            echo
+            echo "===== OS ====="
+            cat /etc/os-release
+            echo
+            echo "===== NODE ====="
+            node --version
+            npm --version
+            echo
+            echo "===== JAVA ====="
+            java -version
+            echo
+            echo "===== GRADLE ====="
+            gradle --version
+          } > build-logs/environment.txt 2>&1
+
+      - name: Clone Vega
+        id: clone_vega
+        shell: bash
+        run: |
+          set +e
+          {
+            echo "===== Clone Vega ====="
+            echo "Repository: $VEGA_REPO"
+            echo "Ref: $VEGA_REF"
+
+            rm -rf vendor/vega-app
+            mkdir -p vendor
+
+            git clone \
+              --depth 1 \
+              --branch "$VEGA_REF" \
+              "$VEGA_REPO" \
+              vendor/vega-app
+
+            echo
+            echo "===== Vega HEAD ====="
+            git -C vendor/vega-app rev-parse HEAD
+
+            echo
+            echo "===== Vega files ====="
+            find vendor/vega-app -maxdepth 2 -type f \
+              | sort | head -300
+          } > build-logs/01-clone-vega.log 2>&1
+
+          status=$?
+          echo "$status" > build-logs/01-clone-vega.exit
+          exit "$status"
+
+      - name: Inspect Vega package
+        id: inspect_vega
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          {
+            echo "===== package.json ====="
+            if [ -f vendor/vega-app/package.json ]; then
+              cat vendor/vega-app/package.json
+            else
+              echo "ERROR: package.json not found"
+            fi
+
+            echo
+            echo "===== Lock files ====="
+            find vendor/vega-app -maxdepth 2 -type f \
+              \( -name 'package-lock.json' \
+              -o -name 'yarn.lock' \
+              -o -name 'pnpm-lock.yaml' \
+              -o -name 'bun.lockb' \) \
+              -print
+
+            echo
+            echo "===== Android candidates ====="
+            find vendor/vega-app -maxdepth 4 -type f \
+              \( -name 'gradlew' \
+              -o -name 'settings.gradle' \
+              -o -name 'settings.gradle.kts' \
+              -o -name 'build.gradle' \
+              -o -name 'build.gradle.kts' \) \
+              -print
+          } > build-logs/02-inspect-vega.log 2>&1
 
       - name: Install Vega dependencies
+        id: npm_install
+        if: success()
         working-directory: vendor/vega-app
         shell: bash
         run: |
-          set -euo pipefail
-          npm ci
+          set +e
+          {
+            echo "===== npm version ====="
+            npm --version
 
-      - name: Apply CineMovie integration
+            echo
+            echo "===== npm ci ====="
+            npm ci --verbose
+          } 2>&1 | tee "$GITHUB_WORKSPACE/build-logs/03-npm-install.log"
+
+          status=${PIPESTATUS[0]}
+          echo "$status" > "$GITHUB_WORKSPACE/build-logs/03-npm-install.exit"
+          exit "$status"
+
+      - name: Apply CineMovie overlay
+        id: overlay
+        if: success()
         shell: bash
         run: |
-          set -euo pipefail
+          set +e
+          {
+            echo "===== Overlay ====="
 
-          if [ -f scripts/apply-overlay.mjs ]; then
-            node scripts/apply-overlay.mjs vendor/vega-app
-          else
-            echo "No overlay script found; building unmodified Vega source."
-          fi
+            if [ -f scripts/apply-overlay.mjs ]; then
+              node scripts/apply-overlay.mjs vendor/vega-app
+            else
+              echo "WARNING: scripts/apply-overlay.mjs not found"
+            fi
+          } 2>&1 | tee build-logs/04-overlay.log
 
-      - name: Validate integration
+          status=${PIPESTATUS[0]}
+          echo "$status" > build-logs/04-overlay.exit
+          exit "$status"
+
+      - name: Validate overlay
+        id: validate
+        if: success()
         shell: bash
         run: |
-          set -euo pipefail
+          set +e
+          {
+            echo "===== Overlay validation ====="
 
-          if [ -f scripts/validate-overlay.mjs ]; then
-            node scripts/validate-overlay.mjs vendor/vega-app
-          fi
+            if [ -f scripts/validate-overlay.mjs ]; then
+              node scripts/validate-overlay.mjs vendor/vega-app
+            else
+              echo "WARNING: validation script not found"
+            fi
 
-          if [ -f scripts/test-quality-selection.mjs ]; then
-            node scripts/test-quality-selection.mjs
-          fi
+            echo
+            echo "===== Quality selection tests ====="
+
+            if [ -f scripts/test-quality-selection.mjs ]; then
+              node scripts/test-quality-selection.mjs
+            else
+              echo "WARNING: quality test script not found"
+            fi
+          } 2>&1 | tee build-logs/05-validation.log
+
+          status=${PIPESTATUS[0]}
+          echo "$status" > build-logs/05-validation.exit
+          exit "$status"
+
+      - name: Build web frontend
+        id: web_build
+        if: success()
+        working-directory: vendor/vega-app
+        shell: bash
+        run: |
+          set +e
+          {
+            echo "===== Available npm scripts ====="
+            npm run
+
+            echo
+            echo "===== build:sandbox ====="
+            npm run build:sandbox
+          } 2>&1 | tee "$GITHUB_WORKSPACE/build-logs/06-web-build.log"
+
+          status=${PIPESTATUS[0]}
+          echo "$status" > "$GITHUB_WORKSPACE/build-logs/06-web-build.exit"
+          exit "$status"
 
       - name: Generate Android project
+        id: prebuild
+        if: success()
         working-directory: vendor/vega-app
         shell: bash
         run: |
-          set -euo pipefail
-          npm run build:sandbox
-          npx expo prebuild -p android --clean
+          set +e
+          {
+            echo "===== Expo version ====="
+            npx expo --version
 
-      - name: Build release APK
+            echo
+            echo "===== Expo prebuild ====="
+            npx expo prebuild -p android --clean
+          } 2>&1 | tee "$GITHUB_WORKSPACE/build-logs/07-expo-prebuild.log"
+
+          status=${PIPESTATUS[0]}
+          echo "$status" > "$GITHUB_WORKSPACE/build-logs/07-expo-prebuild.exit"
+          exit "$status"
+
+      - name: Inspect generated Android project
+        id: inspect_android
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          {
+            echo "===== Android directory ====="
+            if [ -d vendor/vega-app/android ]; then
+              find vendor/vega-app/android -maxdepth 4 -type f \
+                | sort | head -1000
+            else
+              echo "ERROR: android directory does not exist"
+            fi
+
+            echo
+            echo "===== Gradle wrapper ====="
+            if [ -f vendor/vega-app/android/gradlew ]; then
+              ls -l vendor/vega-app/android/gradlew
+              file vendor/vega-app/android/gradlew
+            else
+              echo "ERROR: gradlew not found"
+            fi
+          } > build-logs/08-android-project.log 2>&1
+
+      - name: Build Android APK
+        id: gradle_build
+        if: success()
         working-directory: vendor/vega-app/android
         shell: bash
         run: |
-          set -o pipefail
+          set +e
+
           chmod +x gradlew
 
-          ./gradlew assembleRelease \
-            --no-daemon \
-            --stacktrace \
-            --info \
-            2>&1 | tee "$GITHUB_WORKSPACE/gradle-build.log"
+          {
+            echo "===== Gradle version ====="
+            ./gradlew --version
 
-      - name: Collect build diagnostics
+            echo
+            echo "===== Gradle tasks ====="
+            ./gradlew tasks --all
+
+            echo
+            echo "===== assembleRelease ====="
+            ./gradlew assembleRelease \
+              --no-daemon \
+              --stacktrace \
+              --info \
+              --warning-mode all
+          } 2>&1 | tee "$GITHUB_WORKSPACE/build-logs/09-gradle-build.log"
+
+          status=${PIPESTATUS[0]}
+          echo "$status" > "$GITHUB_WORKSPACE/build-logs/09-gradle-build.exit"
+          exit "$status"
+
+      - name: Collect Gradle reports
         if: always()
         shell: bash
         run: |
           set +e
 
-          mkdir -p build-logs
-
-          {
-            echo "===== GitHub Actions ====="
-            echo "Run: $GITHUB_RUN_ID"
-            echo "Commit: $GITHUB_SHA"
-            echo "Branch: $GITHUB_REF_NAME"
-            echo "Workflow: $GITHUB_WORKFLOW"
-            echo
-            echo "===== Tool versions ====="
-            node --version
-            npm --version
-            java -version
-            echo
-            echo "===== Vega commit ====="
-            if [ -d vendor/vega-app/.git ]; then
-              git -C vendor/vega-app rev-parse HEAD
-              git -C vendor/vega-app describe --tags --always
-            fi
-          } > build-logs/build-summary.txt 2>&1
-
-          if [ -f gradle-build.log ]; then
-            cp gradle-build.log build-logs/gradle-build.log
-          fi
+          mkdir -p build-logs/gradle-reports
 
           if [ -d vendor/vega-app/android ]; then
             find vendor/vega-app/android \
               -type f \
-              \( -name "*.log" -o -name "hs_err_pid*.log" \) \
+              \( -name "*.log" \
+              -o -name "hs_err_pid*.log" \
+              -o -name "*.hprof" \) \
               -print \
-              -exec sh -c 'echo "===== $1 ====="; cat "$1"' _ {} \; \
-              > build-logs/native-logs.txt 2>&1 || true
+              > build-logs/native-log-files.txt 2>&1 || true
+
+            if [ -d vendor/vega-app/android/app/build/reports ]; then
+              cp -R \
+                vendor/vega-app/android/app/build/reports/. \
+                build-logs/gradle-reports/ \
+                2>/dev/null || true
+            fi
           fi
 
-          if [ -d vendor/vega-app/android/app/build/reports ]; then
-            cp -R vendor/vega-app/android/app/build/reports build-logs/android-reports
-          fi
+      - name: Collect final diagnostics
+        if: always()
+        shell: bash
+        run: |
+          set +e
 
-          if [ -d vendor/vega-app/android/app/build/outputs ]; then
-            find vendor/vega-app/android/app/build/outputs \
-              -type f -print \
-              > build-logs/generated-files.txt 2>&1 || true
-          fi
+          {
+            echo "===== STEP RESULTS ====="
+            echo "clone_vega=${{ steps.clone_vega.outcome }}"
+            echo "npm_install=${{ steps.npm_install.outcome }}"
+            echo "overlay=${{ steps.overlay.outcome }}"
+            echo "validate=${{ steps.validate.outcome }}"
+            echo "web_build=${{ steps.web_build.outcome }}"
+            echo "prebuild=${{ steps.prebuild.outcome }}"
+            echo "gradle_build=${{ steps.gradle_build.outcome }}"
+
+            echo
+            echo "===== EXIT CODES ====="
+            for f in build-logs/*.exit; do
+              [ -f "$f" ] || continue
+              echo "$(basename "$f"): $(cat "$f")"
+            done
+
+            echo
+            echo "===== APK FILES ====="
+            find vendor/vega-app/android/app/build \
+              -type f \
+              -name "*.apk" \
+              -print 2>/dev/null || true
+          } > build-logs/10-final-diagnostics.txt 2>&1
 
       - name: Upload APK
         if: success()
@@ -168,11 +385,11 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      - name: Upload build logs
+      - name: Upload complete diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: CineMovie-Vega-Build-Logs
+          name: CineMovie-Vega-Full-Diagnostics
           path: build-logs/
           if-no-files-found: warn
           retention-days: 30
