@@ -1,4 +1,4 @@
-name: CineMovie + Vega 5.0.0
+name: CineMovie + Vega 5.0.0 Build
 
 on:
   workflow_dispatch:
@@ -10,246 +10,411 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: cinemovie-vega-build-${{ github.ref }}
-  cancel-in-progress: true
-
-env:
-  NODE_VERSION: "20"
-  JAVA_VERSION: "17"
-
 jobs:
   build:
-    name: Build Android APK
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 45
+
+    env:
+      CI: true
+      NODE_OPTIONS: --max_old_space_size=4096
+      GRADLE_OPTS: -Dorg.gradle.jvmargs=-Xmx4g -Dorg.gradle.daemon=false
 
     steps:
+      # ------------------------------------------------------------
+      # 1. Checkout
+      # ------------------------------------------------------------
       - name: Checkout source
         uses: actions/checkout@v4
 
-      - name: Setup Java
+      # ------------------------------------------------------------
+      # 2. Java 17
+      # ------------------------------------------------------------
+      - name: Setup Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: ${{ env.JAVA_VERSION }}
+          java-version: "17"
           cache: gradle
 
-      - name: Setup Node.js
+      # ------------------------------------------------------------
+      # 3. Node 20
+      # ------------------------------------------------------------
+      - name: Setup Node.js 20
         uses: actions/setup-node@v4
         with:
-          node-version: ${{ env.NODE_VERSION }}
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
 
-      - name: Create log directory
-        run: mkdir -p build-logs
-
-      - name: Record environment
-        if: always()
+      # ------------------------------------------------------------
+      # 4. Basic diagnostics
+      # ------------------------------------------------------------
+      - name: Environment diagnostics
         run: |
+          mkdir -p build-logs
+
           {
             echo "===== SYSTEM ====="
             uname -a
             echo
-            echo "===== NODE ====="
-            node --version
-            npm --version
-            echo
             echo "===== JAVA ====="
             java -version
             echo
-            echo "===== REPOSITORY ====="
-            git rev-parse HEAD
-            git status --short
-          } > build-logs/environment.log 2>&1
+            echo "===== NODE ====="
+            node --version
+            echo
+            echo "===== NPM ====="
+            npm --version
+            echo
+            echo "===== GIT ====="
+            git --version
+            echo
+            echo "===== PROJECT ====="
+            pwd
+            echo
+            find . -maxdepth 2 -type f \
+              ! -path './.git/*' \
+              | sort | head -300
+          } 2>&1 | tee build-logs/00-environment.log
 
+      # ------------------------------------------------------------
+      # 5. Install dependencies
+      # ------------------------------------------------------------
       - name: Install dependencies
-        id: npm_install
         run: |
-          set +e
+          set -o pipefail
 
           if [ -f package-lock.json ]; then
-            npm ci --verbose 2>&1 | tee build-logs/npm-install.log
+            echo "Using npm ci"
+            npm ci --no-audit --no-fund 2>&1 | tee build-logs/01-npm-install.log
+
           elif [ -f yarn.lock ]; then
+            echo "Using Yarn"
             corepack enable
-            yarn install --frozen-lockfile 2>&1 | tee build-logs/npm-install.log
+            yarn install --frozen-lockfile 2>&1 | tee build-logs/01-yarn-install.log
+
           elif [ -f pnpm-lock.yaml ]; then
+            echo "Using pnpm"
             corepack enable
-            pnpm install --frozen-lockfile 2>&1 | tee build-logs/npm-install.log
+            pnpm install --frozen-lockfile 2>&1 | tee build-logs/01-pnpm-install.log
+
           else
-            npm install 2>&1 | tee build-logs/npm-install.log
+            echo "ERROR: No supported lockfile found."
+            exit 1
           fi
 
-          status=${PIPESTATUS[0]}
-          echo "$status" > build-logs/npm-install.exit
-          exit "$status"
-
-      - name: Run lint
-        id: lint
-        if: success()
+      # ------------------------------------------------------------
+      # 6. Package information
+      # ------------------------------------------------------------
+      - name: Inspect package scripts
         run: |
-          set +e
-          npm run lint 2>&1 | tee build-logs/lint.log
-          status=${PIPESTATUS[0]}
-          echo "$status" > build-logs/lint.exit
-          exit "$status"
+          node <<'NODE' 2>&1 | tee build-logs/02-package-scripts.log
+          const fs = require("fs");
 
-      - name: Run tests
-        id: tests
-        if: success()
+          const pkg = JSON.parse(
+            fs.readFileSync("package.json", "utf8")
+          );
+
+          console.log("name:", pkg.name);
+          console.log("version:", pkg.version);
+          console.log("packageManager:", pkg.packageManager || "none");
+          console.log("");
+          console.log("scripts:");
+
+          for (const [key, value] of Object.entries(pkg.scripts || {})) {
+            console.log(`  ${key}: ${value}`);
+          }
+          NODE
+
+      # ------------------------------------------------------------
+      # 7. Lint - only if available
+      # ------------------------------------------------------------
+      - name: Run lint if available
+        shell: bash
         run: |
-          set +e
+          set -o pipefail
+
+          if npm run | grep -qE '^[[:space:]]+lint'; then
+            echo "Lint script found."
+            npm run lint 2>&1 | tee build-logs/03-lint.log
+          else
+            echo "No lint script. Skipping."
+            echo "SKIPPED" > build-logs/03-lint.log
+          fi
+
+      # ------------------------------------------------------------
+      # 8. Test - only if available
+      # ------------------------------------------------------------
+      - name: Run tests if available
+        shell: bash
+        run: |
+          set -o pipefail
 
           if npm run | grep -qE '^[[:space:]]+test'; then
-            npm test -- --runInBand 2>&1 | tee build-logs/tests.log
-            status=${PIPESTATUS[0]}
+            echo "Test script found."
+            npm test 2>&1 | tee build-logs/04-tests.log
           else
-            echo "No npm test script found; skipped." \
-              | tee build-logs/tests.log
-            status=0
+            echo "No test script. Skipping."
+            echo "SKIPPED" > build-logs/04-tests.log
           fi
 
-          echo "$status" > build-logs/tests.exit
-          exit "$status"
-
-      - name: Build provider sandbox
-        id: sandbox
-        if: success()
+      # ------------------------------------------------------------
+      # 9. Expo diagnostics
+      # ------------------------------------------------------------
+      - name: Expo diagnostics
+        shell: bash
         run: |
-          set +e
+          set -o pipefail
 
-          if npm run | grep -qE '^[[:space:]]+build:sandbox'; then
-            npm run build:sandbox 2>&1 | tee build-logs/sandbox-build.log
-            status=${PIPESTATUS[0]}
+          if [ -x node_modules/.bin/expo ]; then
+            node_modules/.bin/expo --version \
+              2>&1 | tee build-logs/05-expo-version.log
+
+            node_modules/.bin/expo config \
+              2>&1 | tee build-logs/05-expo-config.log || true
           else
-            echo "No build:sandbox script found; skipped." \
-              | tee build-logs/sandbox-build.log
-            status=0
+            echo "Expo CLI not found in node_modules."
+            echo "SKIPPED" > build-logs/05-expo-version.log
           fi
 
-          echo "$status" > build-logs/sandbox-build.exit
-          exit "$status"
+      # ------------------------------------------------------------
+      # 10. Build provider sandbox if project has it
+      # ------------------------------------------------------------
+      - name: Build provider sandbox if available
+        shell: bash
+        run: |
+          set -o pipefail
 
+          if npm run | grep -qE '^[[:space:]]+build:providers'; then
+            npm run build:providers \
+              2>&1 | tee build-logs/06-provider-build.log
+
+          elif npm run | grep -qE '^[[:space:]]+build:provider'; then
+            npm run build:provider \
+              2>&1 | tee build-logs/06-provider-build.log
+
+          else
+            echo "No provider build script. Skipping."
+            echo "SKIPPED" > build-logs/06-provider-build.log
+          fi
+
+      # ------------------------------------------------------------
+      # 11. Expo prebuild
+      # ------------------------------------------------------------
       - name: Generate Android project
-        id: prebuild
-        if: success()
+        shell: bash
         run: |
-          set +e
+          set -o pipefail
 
-          npx expo prebuild \
-            --platform android \
-            --clean \
-            2>&1 | tee build-logs/expo-prebuild.log
+          if [ -x node_modules/.bin/expo ]; then
+            node_modules/.bin/expo prebuild \
+              --platform android \
+              --clean \
+              2>&1 | tee build-logs/07-expo-prebuild.log
+          else
+            echo "Local Expo binary missing."
+            exit 1
+          fi
 
-          status=${PIPESTATUS[0]}
-          echo "$status" > build-logs/expo-prebuild.exit
-          exit "$status"
-
+      # ------------------------------------------------------------
+      # 12. Android project diagnostics
+      # ------------------------------------------------------------
       - name: Inspect Android project
-        if: always()
         run: |
           {
-            echo "===== Android files ====="
-            if [ -d android ]; then
-              find android -maxdepth 4 -type f | sort | head -1000
-            else
-              echo "android directory not found"
-            fi
+            echo "===== ANDROID FILES ====="
+            find android -maxdepth 3 -type f | sort | head -500
 
             echo
-            echo "===== Gradle wrapper ====="
+            echo "===== GRADLE FILES ====="
+            find android -maxdepth 3 \
+              \( -name "*.gradle" -o -name "*.gradle.kts" -o -name "gradle.properties" \) \
+              -type f -print | sort
+
+            echo
+            echo "===== GRADLEW ====="
             if [ -f android/gradlew ]; then
-              ls -l android/gradlew
-            else
-              echo "gradlew not found"
+              ls -lh android/gradlew
+              head -5 android/gradlew
             fi
-          } > build-logs/android-project.log 2>&1
+          } 2>&1 | tee build-logs/08-android-inspect.log
 
-      - name: Build release APK
-        id: gradle
-        if: success()
-        working-directory: android
+      # ------------------------------------------------------------
+      # 13. Ensure gradlew executable
+      # ------------------------------------------------------------
+      - name: Prepare Gradle wrapper
         run: |
-          set +e
+          set -e
 
-          chmod +x gradlew
+          if [ ! -f android/gradlew ]; then
+            echo "ERROR: android/gradlew not found."
+            exit 1
+          fi
+
+          chmod +x android/gradlew
+
+          cd android
+          ./gradlew --version \
+            2>&1 | tee ../build-logs/09-gradle-version.log
+
+      # ------------------------------------------------------------
+      # 14. Gradle assembleRelease
+      # ------------------------------------------------------------
+      - name: Build release APK
+        shell: bash
+        run: |
+          set -o pipefail
+
+          cd android
 
           ./gradlew assembleRelease \
             --no-daemon \
             --stacktrace \
             --info \
             --warning-mode all \
-            2>&1 | tee "$GITHUB_WORKSPACE/build-logs/gradle-build.log"
+            2>&1 | tee ../build-logs/10-gradle-build.log
 
-          status=${PIPESTATUS[0]}
-          echo "$status" > "$GITHUB_WORKSPACE/build-logs/gradle-build.exit"
-          exit "$status"
-
-      - name: Collect Android reports
+      # ------------------------------------------------------------
+      # 15. Find APK
+      # ------------------------------------------------------------
+      - name: Find generated APK
         if: always()
-        run: |
-          set +e
-
-          mkdir -p build-logs/android-reports
-
-          if [ -d android/build/reports ]; then
-            cp -R android/build/reports/. \
-              build-logs/android-reports/ 2>/dev/null || true
-          fi
-
-          if [ -d android/app/build/reports ]; then
-            cp -R android/app/build/reports/. \
-              build-logs/android-reports/ 2>/dev/null || true
-          fi
-
-          find android \
-            -type f \
-            \( -name "*.log" -o -name "hs_err_pid*.log" \) \
-            -print \
-            > build-logs/native-log-files.txt 2>&1 || true
-
-      - name: Final diagnostics
-        if: always()
+        shell: bash
         run: |
           {
-            echo "===== BUILD RESULTS ====="
-            echo "npm_install=${{ steps.npm_install.outcome }}"
-            echo "lint=${{ steps.lint.outcome }}"
-            echo "tests=${{ steps.tests.outcome }}"
-            echo "sandbox=${{ steps.sandbox.outcome }}"
-            echo "prebuild=${{ steps.prebuild.outcome }}"
-            echo "gradle=${{ steps.gradle.outcome }}"
-
-            echo
-            echo "===== EXIT CODES ====="
-            for file in build-logs/*.exit; do
-              [ -f "$file" ] || continue
-              echo "$(basename "$file"): $(cat "$file")"
-            done
-
-            echo
             echo "===== APK FILES ====="
+
+            if [ -d android/app/build/outputs/apk ]; then
+              find android/app/build/outputs/apk \
+                -type f \
+                -name "*.apk" \
+                -exec ls -lh {} \;
+            else
+              echo "APK output directory not found."
+            fi
+
+            echo
+            echo "===== ALL APKs ====="
             find android \
               -type f \
               -name "*.apk" \
-              -print 2>/dev/null || true
-          } > build-logs/final-diagnostics.log 2>&1
+              -exec ls -lh {} \; 2>/dev/null || true
+          } 2>&1 | tee build-logs/11-apk-output.log
 
+      # ------------------------------------------------------------
+      # 16. Copy APK to artifact folder
+      # ------------------------------------------------------------
+      - name: Prepare APK artifact
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p release
+
+          find android \
+            -type f \
+            -name "*.apk" \
+            -exec cp {} release/ \; 2>/dev/null || true
+
+          if [ -z "$(find release -type f -name '*.apk' -print -quit)" ]; then
+            echo "No APK generated."
+            echo "NO_APK" > release/BUILD_RESULT.txt
+          else
+            echo "APK generated successfully."
+            find release -type f -maxdepth 1 -ls
+          fi
+
+      # ------------------------------------------------------------
+      # 17. Collect Gradle reports
+      # ------------------------------------------------------------
+      - name: Collect Gradle reports
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p build-logs/gradle-reports
+
+          if [ -d android/app/build/reports ]; then
+            cp -R android/app/build/reports/* \
+              build-logs/gradle-reports/ 2>/dev/null || true
+          fi
+
+          if [ -d android/build/reports ]; then
+            cp -R android/build/reports/* \
+              build-logs/gradle-reports/ 2>/dev/null || true
+          fi
+
+      # ------------------------------------------------------------
+      # 18. Final diagnostic summary
+      # ------------------------------------------------------------
+      - name: Final build diagnostics
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "=========================================="
+            echo "CineMovie + Vega 5.0.0 BUILD SUMMARY"
+            echo "=========================================="
+            echo
+
+            echo "Repository:"
+            git remote -v || true
+            echo
+
+            echo "Commit:"
+            git rev-parse HEAD || true
+            echo
+
+            echo "Node:"
+            node --version || true
+            echo
+
+            echo "Java:"
+            java -version 2>&1 || true
+            echo
+
+            echo "APK:"
+            find release \
+              -maxdepth 1 \
+              -type f \
+              -name "*.apk" \
+              -printf '%f %s bytes\n' 2>/dev/null || true
+
+            echo
+            echo "=========================================="
+            echo "ERROR-LIKE LINES"
+            echo "=========================================="
+
+            grep -RniE \
+              'error:|error |failed|failure|exception|fatal|Could not|Execution failed|BUILD FAILED' \
+              build-logs \
+              2>/dev/null \
+              | tail -300 || true
+
+          } | tee build-logs/FINAL-DIAGNOSTICS.log
+
+      # ------------------------------------------------------------
+      # 19. Upload APK
+      # ------------------------------------------------------------
       - name: Upload APK
         if: success()
         uses: actions/upload-artifact@v4
         with:
           name: CineMovie-Vega-5.0.0-APK
-          path: |
-            android/app/build/outputs/apk/release/*.apk
-            android/app/build/outputs/apk/**/*.apk
+          path: release/*.apk
           if-no-files-found: error
-          retention-days: 30
+          retention-days: 14
 
+      # ------------------------------------------------------------
+      # 20. Upload complete logs
+      # ------------------------------------------------------------
       - name: Upload complete build logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: CineMovie-Vega-5.0.0-Build-Logs
-          path: build-logs/
+          path: |
+            build-logs/
+            release/BUILD_RESULT.txt
           if-no-files-found: warn
-          retention-days: 30
+          retention-days: 14
